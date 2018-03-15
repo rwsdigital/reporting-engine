@@ -11,6 +11,8 @@ import shutil
 import tempfile
 from contextlib import contextmanager
 
+from py3o.formats import Formats
+
 from odoo import tools
 from odoo.tests.common import TransactionCase
 from odoo.exceptions import ValidationError
@@ -38,6 +40,34 @@ class TestReportPy3o(TransactionCase):
         self.py3o_report = self.env['py3o.report'].create({
             'ir_actions_report_xml_id': self.report.id})
 
+    def test_no_local_fusion_without_fusion_server(self):
+        self.assertTrue(self.report.py3o_is_local_fusion)
+        with self.assertRaises(ValidationError) as e:
+            self.report.py3o_is_local_fusion = False
+        self.assertEqual(
+            e.exception.name,
+            "Can not use not native format in local fusion. "
+            "Please specify a Fusion Server")
+
+    def test_no_native_format_without_fusion_server(self):
+        report = self.env.ref("report_py3o.res_users_report_py3o")
+        formats = Formats()
+        is_native = formats.get_format(report.py3o_filetype).native
+        self.assertTrue(is_native)
+        new_format = None
+        for name in formats.get_known_format_names():
+            format = formats.get_format(name)
+            if not format.native:
+                new_format = name
+                break
+        self.assertTrue(new_format)
+        with self.assertRaises(ValidationError) as e:
+            report.py3o_filetype = new_format
+        self.assertEqual(
+            e.exception.name,
+            "Can not use not native format in local fusion. "
+            "Please specify a Fusion Server")
+
     def test_required_py3_filetype(self):
         self.assertEqual(self.report.report_type, "py3o")
         with self.assertRaises(ValidationError) as e:
@@ -46,40 +76,70 @@ class TestReportPy3o(TransactionCase):
             e.exception.name,
             "Field 'Output Format' is required for Py3O report")
 
-    def _render_patched(self, result_text='test result', call_count=1):
+    def test_reports(self):
         py3o_report = self.env['py3o.report']
         with mock.patch.object(
                 py3o_report.__class__, '_create_single_report') as patched_pdf:
             result = tempfile.mktemp('.txt')
             with open(result, 'w') as fp:
-                fp.write(result_text)
+                fp.write('dummy')
             patched_pdf.return_value = result
-            patched_pdf.side_effect = lambda record, data, save_attachments:\
-                py3o_report._postprocess_report(
-                    result, record.id, save_attachments,
-                ) or result
             # test the call the the create method inside our custom parser
             self.report.render_report(self.env.user.ids,
                                       self.report.report_name,
                                       {})
-            self.assertEqual(call_count, patched_pdf.call_count)
+            self.assertEqual(1, patched_pdf.call_count)
             # generated files no more exists
             self.assertFalse(os.path.exists(result))
-
-    def test_reports(self):
         res = self.report.render_report(
             self.env.user.ids, self.report.report_name, {})
         self.assertTrue(res)
-        self.report.py3o_filetype = 'pdf'
-        res = self.report.render_report(
-            self.env.user.ids, self.report.report_name, {})
-        self.assertTrue(res)
+        py3o_server = self.env['py3o.server'].create({"url": "http://dummy"})
+        # check the call to the fusion server
+        self.report.write({"py3o_filetype": "pdf",
+                           "py3o_server_id": py3o_server.id})
+        with mock.patch('requests.post') as patched_post:
+            magick_response = mock.MagicMock()
+            magick_response.status_code = 200
+            patched_post.return_value = magick_response
+            magick_response.iter_content.return_value = "test result"
+            res = self.report.render_report(
+                self.env.user.ids, self.report.report_name, {})
+            self.assertEqual(('test result', 'pdf'), res)
 
     def test_report_load_from_attachment(self):
-        self.report.write({"attachment_use": True,
+        py3o_report = self.env['py3o.report']
+        with mock.patch.object(
+                py3o_report.__class__, '_create_single_report') as patched_pdf:
+            result = tempfile.mktemp('.txt')
+            with open(result, 'w') as fp:
+                fp.write('dummy')
+            patched_pdf.return_value = result
+            # test the call the the create method inside our custom parser
+            self.report.render_report(self.env.user.ids,
+                                      self.report.report_name,
+                                      {})
+            self.assertEqual(1, patched_pdf.call_count)
+            # generated files no more exists
+            self.assertFalse(os.path.exists(result))
+        res = self.report.render_report(
+            self.env.user.ids, self.report.report_name, {})
+        self.assertTrue(res)
+        py3o_server = self.env['py3o.server'].create({"url": "http://dummy"})
+        # check the call to the fusion server
+        self.report.write({"py3o_filetype": "pdf",
+                           "py3o_server_id": py3o_server.id,
+                           "attachment_use": True,
                            "attachment": "'my_saved_report'"})
         attachments = self.env['ir.attachment'].search([])
-        self._render_patched()
+        with mock.patch('requests.post') as patched_post:
+            magick_response = mock.MagicMock()
+            magick_response.status_code = 200
+            patched_post.return_value = magick_response
+            magick_response.iter_content.return_value = "test result"
+            res = self.report.render_report(
+                self.env.user.ids, self.report.report_name, {})
+            self.assertEqual(('test result', 'pdf'), res)
         new_attachments = self.env['ir.attachment'].search([])
         created_attachement = new_attachments - attachments
         self.assertEqual(1, len(created_attachement))
@@ -91,17 +151,29 @@ class TestReportPy3o(TransactionCase):
         created_attachement.datas = base64.encodestring("new content")
         res = self.report.render_report(
             self.env.user.ids, self.report.report_name, {})
-        self.assertEqual(('new content', self.report.py3o_filetype), res)
+        self.assertEqual(('new content', 'pdf'), res)
 
     def test_report_post_process(self):
         """
         By default the post_process method is in charge to save the
         generated report into an ir.attachment if requested.
         """
-        self.report.attachment = "object.name + '.txt'"
+        report = self.env.ref("report_py3o.res_users_report_py3o")
+        report.attachment = "object.name + '.txt'"
+        py3o_server = self.env['py3o.server'].create({"url": "http://dummy"})
+        # check the call to the fusion server
+        report.write({"py3o_filetype": "pdf",
+                      "py3o_server_id": py3o_server.id})
         ir_attachment = self.env['ir.attachment']
         attachements = ir_attachment.search([(1, '=', 1)])
-        self._render_patched()
+        with mock.patch('requests.post') as patched_post:
+            magick_response = mock.MagicMock()
+            magick_response.status_code = 200
+            patched_post.return_value = magick_response
+            magick_response.iter_content.return_value = "test result"
+            res = report.render_report(
+                self.env.user.ids, report.report_name, {})
+            self.assertEqual(('test result', 'pdf'), res)
         attachements = ir_attachment.search([(1, '=', 1)]) - attachements
         self.assertEqual(1, len(attachements.ids))
         self.assertEqual(self.env.user.name + '.txt', attachements.name)
@@ -109,7 +181,6 @@ class TestReportPy3o(TransactionCase):
         self.assertEqual(self.env.user.id, attachements.res_id)
         self.assertEqual('test result', b64decode(attachements.datas))
 
-    @tools.misc.mute_logger('odoo.addons.report_py3o.models.py3o_report')
     def test_report_template_configs(self):
         # the demo template is specified with a relative path in in the module
         # path
@@ -121,7 +192,7 @@ class TestReportPy3o(TransactionCase):
         res = self.report.render_report(
             self.env.user.ids, self.report.report_name, {})
         self.assertTrue(res)
-        # The generation fails if the template is not found
+        # The generation fails if the tempalte is not found
         self.report.module = False
         with self.assertRaises(TemplateNotFound), self.env.cr.savepoint():
             self.report.render_report(
@@ -141,7 +212,7 @@ class TestReportPy3o(TransactionCase):
                 self.env.user.ids, self.report.report_name, {})
             self.assertTrue(res)
 
-        # the tempalte can also be provided as a binary field
+        # the tempalte can also be provided as a binay field
         self.report.py3o_template_fallback = False
 
         with open(flbk_filename) as tmpl_file:
@@ -156,7 +227,6 @@ class TestReportPy3o(TransactionCase):
             self.env.user.ids, self.report.report_name, {})
         self.assertTrue(res)
 
-    @tools.misc.mute_logger('odoo.addons.report_py3o.models.py3o_report')
     def test_report_template_fallback_validity(self):
         tmpl_name = self.report.py3o_template_fallback
         flbk_filename = pkg_resources.resource_filename(
